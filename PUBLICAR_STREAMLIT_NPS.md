@@ -33,6 +33,7 @@ En `Secrets` pegar:
 GOOGLE_DRIVE_NPS_URL = "https://drive.google.com/drive/folders/1JcQyaMxXY4ZcRooXPgWGZ5QjWXUHzsil?usp=drive_link"
 PLANES_ACCION_NPS_API_URL = "https://script.google.com/macros/s/AKfycbzAW3Cq82gjIEVZq25mExuEUpc2ZgEFlq9DSsLOonqaQUK7DV7_cAnCcVwAJqCw3pVPPw/exec"
 FORCE_GDRIVE_REFRESH = "false"
+GDRIVE_CACHE_TTL_HOURS = "6"
 ```
 
 ## Actualizar datos

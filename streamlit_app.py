@@ -84,7 +84,14 @@ def download_drive_folder() -> Path | None:
     url = secret_or_env("GOOGLE_DRIVE_NPS_URL", DEFAULT_DRIVE_URL)
     target = PROJECT_ROOT / ".cloud_data" / "nps"
     refresh = truthy(secret_or_env("FORCE_GDRIVE_REFRESH", "false"))
-    if target.exists() and any(target.iterdir()) and not refresh:
+    cache_ttl_hours = pd.to_numeric(secret_or_env("GDRIVE_CACHE_TTL_HOURS", "6"), errors="coerce")
+    cache_ttl_hours = 6 if pd.isna(cache_ttl_hours) else float(cache_ttl_hours)
+    cache_is_fresh = False
+    if target.exists() and any(target.iterdir()):
+        newest = max((path.stat().st_mtime for path in target.iterdir() if path.is_file()), default=0)
+        cache_age_hours = (datetime.now().timestamp() - newest) / 3600 if newest else 9999
+        cache_is_fresh = cache_age_hours <= cache_ttl_hours
+    if target.exists() and any(target.iterdir()) and not refresh and cache_is_fresh:
         return target
 
     try:
@@ -203,6 +210,8 @@ def normalize_nps(nps: pd.DataFrame, clients: pd.DataFrame, routes: pd.DataFrame
         if pd.isna(score) or score < 0 or score > 10:
             continue
         date = pd.to_datetime(row.get(fecha_col), errors="coerce", dayfirst=True) if fecha_col else pd.NaT
+        if pd.isna(date) or date.normalize() > pd.Timestamp.today().normalize():
+            continue
         full_client = str(row.get(full_client_col, "") or "") if full_client_col else ""
         distributor = norm_code(row.get(dist_col)) if dist_col else ""
         client_digits = norm_code(full_client)
