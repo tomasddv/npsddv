@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -240,6 +241,136 @@ def nps_score(df: pd.DataFrame) -> float:
     return float((promoters - detractors) * 100)
 
 
+def pct_value(numerator: int | float, denominator: int | float) -> float:
+    return float(numerator / denominator * 100) if denominator else 0.0
+
+
+def filtered_unique_surveys(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    dedupe_cols = [col for col in ["fecha", "cliente_codigo", "score"] if col in df.columns]
+    return df.drop_duplicates(dedupe_cols) if dedupe_cols else df.drop_duplicates()
+
+
+def pain_point(row: pd.Series) -> bool:
+    text = f"{row.get('subdriver', '')} {row.get('comentario', '')}".lower()
+    negative_terms = [
+        "no ",
+        "sin ",
+        "problema",
+        "falla",
+        "demora",
+        "incorrect",
+        "pendiente",
+        "reclamo",
+        "faltante",
+        "malo",
+        "difícil",
+        "dificil",
+        "tarde",
+        "nunca",
+    ]
+    neutral = {"", "ninguno", "sin comentario", "na", "n/a", "null"}
+    return text.strip() not in neutral and any(term in text for term in negative_terms)
+
+
+def priority_for(row: pd.Series) -> str:
+    if row.get("tipo_nps") == "Detractor" and pain_point(row):
+        return "Alta"
+    if row.get("tipo_nps") == "Detractor":
+        return "Media"
+    if row.get("tipo_nps") == "Pasivo":
+        return "Media"
+    return "Baja"
+
+
+def render_kpi_cards(df: pd.DataFrame, full_df: pd.DataFrame) -> None:
+    unique = filtered_unique_surveys(df)
+    previous_delta = ""
+    if "mes" in df.columns and not full_df.empty:
+        months = sorted([m for m in full_df["mes"].dropna().unique() if m != "Sin fecha"])
+        current_month = df["mes"].mode().iloc[0] if not df.empty and not df["mes"].empty else None
+        if current_month in months:
+            idx = months.index(current_month)
+            if idx > 0:
+                prev_df = full_df[full_df["mes"] == months[idx - 1]]
+                previous_delta = f"{nps_score(df) - nps_score(prev_df):+.1f} vs mes ant."
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    total = len(unique)
+    promoters = int(unique["tipo_nps"].eq("Promotor").sum()) if not unique.empty else 0
+    passive = int(unique["tipo_nps"].eq("Pasivo").sum()) if not unique.empty else 0
+    detractors = int(unique["tipo_nps"].eq("Detractor").sum()) if not unique.empty else 0
+    k1.metric("NPS", f"{nps_score(unique):.1f}", previous_delta)
+    k2.metric("Encuestas", f"{total:,.0f}".replace(",", "."))
+    k3.metric("Promotores", f"{promoters:,.0f}".replace(",", "."), f"{pct_value(promoters, total):.1f}%")
+    k4.metric("Pasivos", f"{passive:,.0f}".replace(",", "."), f"{pct_value(passive, total):.1f}%")
+    k5.metric("Detractores", f"{detractors:,.0f}".replace(",", "."), f"{pct_value(detractors, total):.1f}%")
+    k6.metric("Planes guardados", f"{len(load_shared_plans()):,.0f}".replace(",", "."))
+
+
+def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for mes, group in df[df["mes"] != "Sin fecha"].groupby("mes"):
+        unique = filtered_unique_surveys(group)
+        total = len(unique)
+        promoters = int(unique["tipo_nps"].eq("Promotor").sum())
+        passive = int(unique["tipo_nps"].eq("Pasivo").sum())
+        detractors = int(unique["tipo_nps"].eq("Detractor").sum())
+        rows.append(
+            {
+                "mes": mes,
+                "NPS": nps_score(unique),
+                "Encuestas": total,
+                "Promotores": promoters,
+                "Pasivos": passive,
+                "Detractores": detractors,
+                "% Promotores": pct_value(promoters, total),
+                "% Pasivos": pct_value(passive, total),
+                "% Detractores": pct_value(detractors, total),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("mes")
+
+
+def promoter_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for promotor, group in df.groupby("promotor", dropna=False):
+        unique = filtered_unique_surveys(group)
+        if unique.empty:
+            continue
+        rows.append(
+            {
+                "Promotor": promotor,
+                "NPS": nps_score(unique),
+                "Encuestas": len(unique),
+                "Detractores": int(unique["tipo_nps"].eq("Detractor").sum()),
+                "Pasivos": int(unique["tipo_nps"].eq("Pasivo").sum()),
+                "Promotores": int(unique["tipo_nps"].eq("Promotor").sum()),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["NPS", "Encuestas"], ascending=[False, False])
+
+
+def recurrent_clients(df: pd.DataFrame) -> pd.DataFrame:
+    scoped = df[df["tipo_nps"].isin(["Detractor", "Pasivo"])].copy()
+    if scoped.empty:
+        return pd.DataFrame()
+    return (
+        scoped.groupby(["cliente_codigo", "cliente"], as_index=False)
+        .agg(
+            meses=("mes", "nunique"),
+            casos=("id", "count"),
+            ultimo_mes=("mes", "max"),
+            ultimo_score=("score", "last"),
+            driver=("driver", "last"),
+            subdriver=("subdriver", "last"),
+            promotor=("promotor", "last"),
+        )
+        .sort_values(["meses", "casos"], ascending=False)
+    )
+
+
 def plan_api_url() -> str:
     return secret_or_env("PLANES_ACCION_NPS_API_URL", DEFAULT_PLAN_API_URL)
 
@@ -336,30 +467,55 @@ def main() -> None:
     if driver != "Todos":
         filtered = filtered[filtered["driver"] == driver]
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("NPS", f"{nps_score(filtered):.1f}")
-    k2.metric("Encuestas", f"{len(filtered):,.0f}".replace(",", "."))
-    k3.metric("Promotores", f"{(filtered['tipo_nps'].eq('Promotor')).sum():,.0f}".replace(",", "."))
-    k4.metric("Pasivos", f"{(filtered['tipo_nps'].eq('Pasivo')).sum():,.0f}".replace(",", "."))
-    k5.metric("Detractores", f"{(filtered['tipo_nps'].eq('Detractor')).sum():,.0f}".replace(",", "."))
+    render_kpi_cards(filtered, df)
 
-    tab_resumen, tab_drivers, tab_planes, tab_auditoria = st.tabs(
-        ["Resumen", "Drivers", "Planes compartidos", "Auditoria"]
+    tab_resumen, tab_drivers, tab_dolor, tab_sugeridos, tab_planes, tab_promotores, tab_auditoria = st.tabs(
+        [
+            "Resumen ejecutivo",
+            "Driver y Subdriver",
+            "Puntos de dolor",
+            "Planes sugeridos",
+            "Plan mensual compartido",
+            "Promotores / Rutas",
+            "Auditoria Galaxia",
+        ]
     )
 
     with tab_resumen:
         left, right = st.columns((1.2, 1))
-        monthly = df[df["mes"] != "Sin fecha"].groupby("mes").apply(nps_score).reset_index(name="NPS")
+        monthly = monthly_summary(df)
         left.plotly_chart(
             px.line(monthly, x="mes", y="NPS", markers=True, title="Evolucion mensual NPS"),
             use_container_width=True,
         )
-        mix = filtered["tipo_nps"].value_counts().reset_index()
+        mix = filtered_unique_surveys(filtered)["tipo_nps"].value_counts().reset_index()
         mix.columns = ["Tipo", "Encuestas"]
         right.plotly_chart(
-            px.donut(mix, names="Tipo", values="Encuestas", hole=.55, title="Composicion NPS"),
+            px.pie(
+                mix,
+                names="Tipo",
+                values="Encuestas",
+                hole=.55,
+                title="Composicion NPS",
+                color="Tipo",
+                color_discrete_map={"Promotor": "#22c55e", "Pasivo": "#facc15", "Detractor": "#fb7185"},
+            ),
             use_container_width=True,
         )
+        st.subheader("Resumen mensual")
+        st.dataframe(
+            monthly.style.format(
+                {
+                    "NPS": "{:.1f}",
+                    "% Promotores": "{:.1f}%",
+                    "% Pasivos": "{:.1f}%",
+                    "% Detractores": "{:.1f}%",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.subheader("Base filtrada")
         st.dataframe(
             filtered[["mes", "cliente_codigo", "cliente", "score", "tipo_nps", "driver", "subdriver", "promotor", "comentario"]],
             use_container_width=True,
@@ -369,11 +525,93 @@ def main() -> None:
     with tab_drivers:
         detractors = filtered[filtered["tipo_nps"].isin(["Detractor", "Pasivo"])]
         driver_summary = detractors.groupby(["driver", "subdriver"], as_index=False).size().rename(columns={"size": "casos"})
+        driver_totals = detractors.groupby("driver", as_index=False).size().rename(columns={"size": "casos"})
+        c1, c2 = st.columns((1, 1))
+        c1.plotly_chart(
+            px.treemap(driver_summary, path=["driver", "subdriver"], values="casos", color="casos", title="Arbol de drivers y subdrivers"),
+            use_container_width=True,
+        )
+        c2.plotly_chart(
+            px.bar(driver_totals.sort_values("casos", ascending=False), x="driver", y="casos", color="driver", title="Casos por driver"),
+            use_container_width=True,
+        )
         st.plotly_chart(
             px.bar(driver_summary.sort_values("casos", ascending=False).head(20), x="casos", y="subdriver", color="driver", orientation="h", title="Principales drivers de dolor"),
             use_container_width=True,
         )
         st.dataframe(driver_summary.sort_values("casos", ascending=False), use_container_width=True, hide_index=True)
+
+    with tab_dolor:
+        pain = filtered.copy()
+        pain["punto_de_dolor"] = pain.apply(pain_point, axis=1)
+        pain = pain[pain["punto_de_dolor"] | pain["tipo_nps"].isin(["Detractor", "Pasivo"])]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Casos a revisar", len(pain))
+        c2.metric("Clientes afectados", pain["cliente_codigo"].nunique())
+        c3.metric("Drivers distintos", pain["driver"].nunique())
+        if not pain.empty:
+            st.plotly_chart(
+                px.scatter(
+                    pain,
+                    x="score",
+                    y="driver",
+                    color="tipo_nps",
+                    size=[1] * len(pain),
+                    hover_data=["cliente", "subdriver", "comentario", "promotor"],
+                    title="Mapa de puntos de dolor por score y driver",
+                    color_discrete_map={"Promotor": "#22c55e", "Pasivo": "#facc15", "Detractor": "#fb7185"},
+                ),
+                use_container_width=True,
+            )
+        st.dataframe(
+            pain[["mes", "cliente_codigo", "cliente", "score", "tipo_nps", "driver", "subdriver", "promotor", "comentario"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tab_sugeridos:
+        plan_candidates = filtered[filtered["tipo_nps"].isin(["Detractor", "Pasivo"])].copy()
+        if plan_candidates.empty:
+            st.info("No hay detractores o pasivos con los filtros actuales.")
+        else:
+            plan_candidates["prioridad"] = plan_candidates.apply(priority_for, axis=1)
+            plan_candidates["problema"] = plan_candidates.apply(
+                lambda r: f"{r['tipo_nps']} por {r['driver']} / {r['subdriver']}",
+                axis=1,
+            )
+            plan_candidates["accion_recomendada"] = plan_candidates.apply(action_text, axis=1)
+            plan_candidates["responsable_sugerido"] = plan_candidates["promotor"]
+            plan_candidates["estado_sugerido"] = "Pendiente"
+            st.plotly_chart(
+                px.bar(
+                    plan_candidates.groupby(["prioridad", "driver"], as_index=False).size().rename(columns={"size": "casos"}),
+                    x="driver",
+                    y="casos",
+                    color="prioridad",
+                    title="Planes sugeridos por prioridad",
+                    color_discrete_map={"Alta": "#fb7185", "Media": "#facc15", "Baja": "#22c55e"},
+                ),
+                use_container_width=True,
+            )
+            st.dataframe(
+                plan_candidates[
+                    [
+                        "mes",
+                        "cliente_codigo",
+                        "cliente",
+                        "score",
+                        "tipo_nps",
+                        "driver",
+                        "subdriver",
+                        "problema",
+                        "accion_recomendada",
+                        "responsable_sugerido",
+                        "prioridad",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with tab_planes:
         plans = load_shared_plans()
@@ -437,6 +675,38 @@ def main() -> None:
         else:
             st.dataframe(plans, use_container_width=True, hide_index=True)
 
+    with tab_promotores:
+        ranking = promoter_ranking(filtered)
+        c1, c2 = st.columns((1.2, 1))
+        if not ranking.empty:
+            c1.plotly_chart(
+                px.bar(
+                    ranking.sort_values("NPS").tail(15),
+                    x="NPS",
+                    y="Promotor",
+                    color="NPS",
+                    orientation="h",
+                    title="Ranking de promotores por NPS",
+                    color_continuous_scale=["#fb7185", "#facc15", "#22c55e"],
+                ),
+                use_container_width=True,
+            )
+            c2.plotly_chart(
+                px.bar(
+                    ranking.sort_values("Detractores", ascending=False).head(15),
+                    x="Detractores",
+                    y="Promotor",
+                    orientation="h",
+                    title="Promotores con mas detractores",
+                    color="Detractores",
+                    color_continuous_scale=["#22c55e", "#facc15", "#fb7185"],
+                ),
+                use_container_width=True,
+            )
+        st.dataframe(ranking, use_container_width=True, hide_index=True)
+        st.subheader("Clientes recurrentes detractores/pasivos")
+        st.dataframe(recurrent_clients(df), use_container_width=True, hide_index=True)
+
     with tab_auditoria:
         st.write("Fuente de datos")
         st.json(meta)
@@ -452,6 +722,20 @@ def main() -> None:
             use_container_width=True,
             hide_index=True,
         )
+        requirements = pd.DataFrame(
+            [
+                {"Requisito": "Archivo NPS", "Estado": "OK" if meta.get("nps_file") != "No detectado" else "FALTA", "Detalle": meta.get("nps_file")},
+                {"Requisito": "Score", "Estado": "OK" if "score" in df.columns else "FALTA", "Detalle": "Columna normalizada score"},
+                {"Requisito": "Fecha encuesta", "Estado": "OK" if "fecha" in df.columns else "FALTA", "Detalle": "Fecha normalizada"},
+                {"Requisito": "Drivers/Subdrivers", "Estado": "OK" if {"driver", "subdriver"}.issubset(df.columns) else "FALTA", "Detalle": "Driver y subdriver normalizados"},
+                {"Requisito": "Promotor/Ruta", "Estado": "PARCIAL" if int(df["matched_route"].sum()) < len(df) else "OK", "Detalle": f"{int(df['matched_route'].sum())}/{len(df)} encuestas con ruta/promotor"},
+                {"Requisito": "Planes compartidos", "Estado": "OK" if plan_api_url() else "FALTA", "Detalle": "Google Sheet via Apps Script"},
+            ]
+        )
+        st.subheader("Estado Galaxia")
+        ok_count = int(requirements["Estado"].eq("OK").sum())
+        st.progress(ok_count / len(requirements))
+        st.dataframe(requirements, use_container_width=True, hide_index=True)
 
     st.markdown("<div class='footer'>by QπU</div>", unsafe_allow_html=True)
 
