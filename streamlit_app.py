@@ -48,6 +48,18 @@ def norm_code(value: object) -> str:
     return digits.lstrip("0") or digits
 
 
+def parse_nps_date(value: object) -> pd.Timestamp:
+    text = str(value or "").strip()
+    if not text:
+        return pd.NaT
+    # New NPS exports use ISO-like yyyy-mm-dd dates. Parsing those with
+    # dayfirst=True turns 2026-06-08 into 2026-08-06, which then gets
+    # dropped as a future survey.
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return pd.to_datetime(text, errors="coerce", dayfirst=False)
+    return pd.to_datetime(text, errors="coerce", dayfirst=True)
+
+
 def first_col(df: pd.DataFrame, options: list[str]) -> str | None:
     keys = {key(col): col for col in df.columns}
     for option in options:
@@ -242,7 +254,7 @@ def normalize_nps(nps: pd.DataFrame, clients: pd.DataFrame, routes: pd.DataFrame
         score = pd.to_numeric(row.get(score_col), errors="coerce") if score_col else pd.NA
         if pd.isna(score) or score < 0 or score > 10:
             continue
-        date = pd.to_datetime(row.get(fecha_col), errors="coerce", dayfirst=True) if fecha_col else pd.NaT
+        date = parse_nps_date(row.get(fecha_col)) if fecha_col else pd.NaT
         if pd.isna(date) or date.normalize() > pd.Timestamp.today().normalize():
             continue
         full_client = str(row.get(full_client_col, "") or "") if full_client_col else ""
