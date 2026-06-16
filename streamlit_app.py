@@ -80,10 +80,30 @@ def read_sheet_with_detected_header(path: Path, sheet: str) -> pd.DataFrame:
     return data
 
 
+def sheet_names(path: Path) -> list[str]:
+    with pd.ExcelFile(path) as excel:
+        return excel.sheet_names
+
+
+def find_sheet_by_columns(path: Path, required_options: list[list[str]]) -> tuple[str, pd.DataFrame]:
+    names = sheet_names(path)
+    fallback = names[0] if names else ""
+    fallback_df = pd.DataFrame()
+    for idx, sheet in enumerate(names):
+        df = read_sheet_with_detected_header(path, sheet)
+        if idx == 0:
+            fallback_df = df
+        if all(first_col(df, options) for options in required_options):
+            return sheet, df
+    return fallback, fallback_df
+
+
 def download_drive_folder() -> Path | None:
     url = secret_or_env("GOOGLE_DRIVE_NPS_URL", DEFAULT_DRIVE_URL)
     target = PROJECT_ROOT / ".cloud_data" / "nps"
-    refresh = truthy(secret_or_env("FORCE_GDRIVE_REFRESH", "false"))
+    refresh = truthy(secret_or_env("FORCE_GDRIVE_REFRESH", "false")) and not st.session_state.get(
+        "drive_refreshed_once", False
+    )
     cache_ttl_hours = pd.to_numeric(secret_or_env("GDRIVE_CACHE_TTL_HOURS", "6"), errors="coerce")
     cache_ttl_hours = 6 if pd.isna(cache_ttl_hours) else float(cache_ttl_hours)
     cache_is_fresh = False
@@ -108,6 +128,7 @@ def download_drive_folder() -> Path | None:
     except Exception as exc:
         st.error(f"No pude descargar Google Drive: {exc}")
         return None
+    st.session_state["drive_refreshed_once"] = True
     return target if target.exists() and any(target.iterdir()) else None
 
 
@@ -118,6 +139,12 @@ def pick_file(folder: Path, include: list[str]) -> Path | None:
         if all(term in name for term in include):
             candidates.append(path)
     return max(candidates, key=lambda p: p.stat().st_mtime, default=None)
+
+
+def clear_drive_cache() -> None:
+    target = PROJECT_ROOT / ".cloud_data" / "nps"
+    if target.exists():
+        shutil.rmtree(target)
 
 
 @st.cache_data(show_spinner=False)
@@ -131,15 +158,9 @@ def load_nps_data(refresh_key: str) -> tuple[pd.DataFrame, dict[str, object]]:
     if nps_file is None:
         return pd.DataFrame(), {"error": "No se encontro archivo NPS"}
 
-    nps_sheets = pd.ExcelFile(nps_file).sheet_names
-    nps_frames = {sheet: read_sheet_with_detected_header(nps_file, sheet) for sheet in nps_sheets}
-    nps_sheet, nps_df = next(
-        (
-            (name, df)
-            for name, df in nps_frames.items()
-            if first_col(df, ["score"]) and first_col(df, ["fecha_enc", "fecha"])
-        ),
-        (nps_sheets[0], nps_frames[nps_sheets[0]]),
+    nps_sheet, nps_df = find_sheet_by_columns(
+        nps_file,
+        [["score"], ["fecha_enc", "fecha enc", "fecha"]],
     )
 
     client_df = pd.DataFrame()
@@ -147,14 +168,18 @@ def load_nps_data(refresh_key: str) -> tuple[pd.DataFrame, dict[str, object]]:
     client_sheet = "No detectada"
     route_sheet = "No detectada"
     if client_file is not None:
-        for sheet in pd.ExcelFile(client_file).sheet_names:
+        client_sheet, client_df = find_sheet_by_columns(
+            client_file,
+            [["cliente"], ["codigo ruta vta", "ruta"]],
+        )
+        for sheet in sheet_names(client_file):
+            if "ruta" not in key(sheet):
+                continue
             df = read_sheet_with_detected_header(client_file, sheet)
-            if first_col(df, ["cliente"]) and first_col(df, ["codigo ruta vta", "ruta"]):
-                client_df = df
-                client_sheet = sheet
-            if "ruta" in key(sheet) and first_col(df, ["codigo"]) and first_col(df, ["vendedor"]):
+            if first_col(df, ["codigo"]) and first_col(df, ["vendedor"]):
                 route_df = df
                 route_sheet = sheet
+                break
 
     rows = normalize_nps(nps_df, client_df, route_df)
     meta = {
@@ -172,7 +197,15 @@ def load_nps_data(refresh_key: str) -> tuple[pd.DataFrame, dict[str, object]]:
 def normalize_nps(nps: pd.DataFrame, clients: pd.DataFrame, routes: pd.DataFrame) -> pd.DataFrame:
     fecha_col = first_col(nps, ["fecha_enc", "fecha enc", "fecha"])
     score_col = first_col(nps, ["score"])
-    full_client_col = first_col(nps, ["cod_cliente_distribuidor_activo", "cod cliente distribuidor activo"])
+    full_client_col = first_col(
+        nps,
+        [
+            "cod_cliente_distribuidor_activo",
+            "cod cliente distribuidor activo",
+            "cod cliente dist",
+            "cod_cliente_dist",
+        ],
+    )
     dist_col = first_col(nps, ["cod_distribuidor", "cod distribuidor"])
     name_col = first_col(nps, ["nombre_cliente", "nombre cliente"])
     driver_col = first_col(nps, ["primer_driver", "driver primario"])
@@ -303,7 +336,7 @@ def render_kpi_cards(df: pd.DataFrame, full_df: pd.DataFrame) -> None:
             idx = months.index(current_month)
             if idx > 0:
                 prev_df = full_df[full_df["mes"] == months[idx - 1]]
-                previous_delta = f"{nps_score(df) - nps_score(prev_df):+.1f} vs mes ant."
+                previous_delta = f"{nps_score(filtered_unique_surveys(df)) - nps_score(filtered_unique_surveys(prev_df)):+.1f} vs mes ant."
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     total = len(unique)
@@ -451,6 +484,7 @@ def main() -> None:
     )
 
     if st.sidebar.button("Actualizar datos"):
+        clear_drive_cache()
         st.cache_data.clear()
         st.rerun()
 
